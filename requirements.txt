@@ -1,0 +1,11 @@
+# Required Python packages
+pyserial>=3.4
+PyYAML==6.0.2
+
+
+# Standard library packages used (included for reference)
+# argparse
+# random
+# struct
+# threading
+# time
