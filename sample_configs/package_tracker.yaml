@@ -1,4 +1,4 @@
-# Configuration for Murata 1SC EVK Low Powered Tracker Demo
+# Configuration for a package tracker demonstration.
 # All values can be overridden by command line parameters
 
 # Serial port for the modem (Windows example: COM3, Linux example: /dev/ttyUSB0)
@@ -9,19 +9,20 @@ server: udp-eu.tartabit.com:10106
 
 location:
   # simulated, cellid
-  type: simulated
-  lat: 45.448803450183924
-  lon: -75.63533774831912
+  type: cellid
+  #type: simulated
+  #lat: 45.448803450183924
+  #lon: -75.63533774831912
 
 # Reporting interval in seconds
-interval: 120
+interval: 3600
 
 # Reading interval in seconds (sensor sampling)
-readings: 60
+readings: 1800
 
 # Motion event settings (if either is missing, motion events are disabled)
-motionDuration: 120   # seconds between motion start and motion stop
-motionInterval: 600   # seconds from motion end to next motion start
+#motionDuration: 120   # seconds between motion start and motion stop
+#motionInterval: 600   # seconds from motion end to next motion start
 
 # Optional: Override IMEI (otherwise read from modem)
 imei: 

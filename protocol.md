@@ -20,10 +20,11 @@ Every packet starts with a fixed header:
     - Two ASCII characters. If the logical command is a single character, the second byte is a null ("\0"). Examples: "T\0", "C\0", "P+", "A\0".
 - Transaction ID: 2 bytes (uint16, big-endian)
     - Sequence number for matching requests and acknowledgments. Wraps modulo 65536.
-- IMEI: 15 bytes (ASCII)
-    - Not null-terminated. Left as-is; do not pad or shorten beyond 15 bytes.
+- IMEI: 8 bytes (packed BCD)
+    - Encoding: decimal digits packed two per byte, low nibble = first digit, high nibble = second digit. If the number of digits is odd (e.g., 15), prepend a leading 0 nibble to make an even number of nibbles (example below).
+    - Example: "358419511056392" -> 03 58 41 95 11 05 63 92.
 
-Header total: 1 + 2 + 2 + 15 = 20 bytes.
+Header total: 1 + 2 + 2 + 8 = 13 bytes.
 
 Following the header is the Command-specific body (which may be empty).
 
@@ -33,6 +34,8 @@ The protocol is centered around commands, each packet has a command field that d
     - P+ (Power On): Device → Server
     - C (Configuration): Device → Server (in response to request, or proactively on startup)
     - T (Telemetry): Device → Server (periodic)
+    - M+ (Motion Start): Device → Server (event)
+    - M- (Motion Stop): Device → Server (event)
 - Cloud to device commands
     - A (Acknowledge): Server → Device (for any packet that requires ack)
     - C (Configuration Request): Server → Device (request device to send its current configuration)
@@ -44,8 +47,9 @@ When you implement the protocol, you can add other commands as needed and implem
 Send when the device powers on and connects to the network.
 
 Body, in order:
-- Customer ID: 4 bytes
-    - Raw 4-byte value. In the reference app, it is provided as a hex string (e.g., "00000000"), then converted to 4 bytes.
+- Customer ID: VarBytes
+    - Encoding: 1-byte length N (uint8) followed by N raw bytes.
+    - The bytes are obtained by hex-decoding the provided code string (even-length hex characters). Example: code "00000000" -> length=4, bytes 00 00 00 00.
 - Software Version: VarString
 - Modem Firmware Version: VarString
 - MCC: VarString
@@ -79,6 +83,8 @@ Body, in order:
 - Timestamp: 4 bytes (uint32)
     - Unix time (seconds since epoch).
 - LocationData: variable, see below
+- SensorDataCount: 1 byte (uint8)
+    - Number of SensorData structures that follow; currently 1 in the reference app.
 - SensorData: variable, see below (the sample uses SensorMultiData v1)
 
 Semantics:
@@ -97,7 +103,8 @@ Semantics:
 - The Transaction ID in the header must match the Transaction ID of the packet being acknowledged.
 
 Device behavior:
-- For each sent packet that expects an ack (P+, C, T), the device waits up to a timeout (default 30 seconds in the sample) for an A with the same Transaction ID. If not received, it treats it as a timeout.
+- For each sent packet that expects an ack (P+, C, T, M+, M-), the device waits up to a timeout (default 30 seconds in the sample) for an A with the same Transaction ID. If not received, it treats it as a timeout.
+- ACKs may arrive out of order relative to packet sends; devices must match ACKs strictly by Transaction ID (not by sequence of arrival).
 
 ### Packet: Configuration Request (Command "C") — Server → Device
 
@@ -160,13 +167,15 @@ When Type = 3 (WIFI):
 
 ### SensorData Encoding
 
-The Telemetry packet concludes with a SensorData payload. The sample app uses SensorMultiData (type=2, version=1), but the encoding starts with a generic header that allows for versioning.
+The Telemetry and Motion packets carry one or more SensorData items. Each item begins with a generic header that allows for versioning and variable-length payloads.
 
 Common SensorData header:
 - sensor_type: 1 byte (uint8)
 - sensor_version: 1 byte (uint8)
+- sensor_length: 1 byte (uint8) — number of bytes in the payload that follows
 
 #### SensorMultiData (type=2, version=1)
+Payload:
 - battery: 1 byte (uint8) — percentage
 - rssi: 1 byte (uint8)
 - first_record_time: 4 bytes (uint32) — Unix time of the first sample in the series
@@ -176,6 +185,16 @@ Common SensorData header:
     - temperature: 2 bytes (int16) — tenths of degrees Celsius (value = temperature_C × 10)
     - humidity: 2 bytes (int16) — tenths of percent RH (value = humidity_% × 10)
 
+#### NullSensorData (type=0, version=0)
+Payload: (empty)
+- Used in Motion Start (M+) to indicate no sensor values are attached.
+
+#### MotionSensorData (type=3, version=1)
+Payload:
+- battery: 1 byte (uint8) — percentage
+- rssi: 1 byte (uint8)
+- steps: 4 bytes (int32)
+
 #### <Custom Encoding>
 Below are the steps to define your own encoding.
 1. Assign a type code and start at version 1.
@@ -184,6 +203,36 @@ Below are the steps to define your own encoding.
 
 Notes:
 - You can extend the Telemetry packet with additional data formats by defining your own type/version that has dynamic collections of data fields available.
+
+### Packet: Motion Start (Command "M+")
+Send to indicate the start of a motion window.
+
+Body, in order:
+- Timestamp: 4 bytes (uint32)
+    - Unix time (seconds since epoch).
+- LocationData: variable, see below
+- SensorDataCount: 1 byte (uint8)
+    - Number of SensorData structures that follow; currently 1.
+- SensorData: NullSensorData (type=0, version=0, length=0)
+
+Semantics:
+- Used to mark the beginning of a motion activity period. Must be acknowledged (A).
+
+### Packet: Motion Stop (Command "M-")
+Send to indicate the end of a motion window.
+
+Body, in order:
+- Timestamp: 4 bytes (uint32)
+    - Unix time (seconds since epoch).
+- LocationData: variable, see below
+- SensorDataCount: 1 byte (uint8)
+    - Number of SensorData structures that follow; currently 1.
+- SensorData: MotionSensorData (type=3, version=1)
+    - Payload: battery (u8), rssi (u8), steps (i32)
+
+Semantics:
+- Used to mark the end of a motion activity period and report summary stats.
+- Must be acknowledged (A).
 
 ## State and Flow
 
@@ -208,17 +257,18 @@ Transaction ID handling:
 
 Acknowledgment handling:
 - Device considers a packet acknowledged only when it receives an A with a matching Transaction ID. An A with a different Transaction ID should not be considered a valid ack for the current in-flight packet.
+- ACKs may arrive out of order relative to the order of sent packets; implementations must match and resolve ACKs by Transaction ID.
 
 ### Binary Layout Summaries
 
-Header (20 bytes):
+Header (13 bytes):
 - [0] Version (u8)
 - [1..2] Command (2×ASCII)
 - [3..4] Transaction ID (u16 be)
-- [5..19] IMEI (15×ASCII)
+- [5..12] IMEI (8×packed BCD)
 
 P+ body:
-- [20..23] Customer ID (4 bytes)
+- VarBytes: Customer ID (1-byte length N, then N bytes)
 - VarString: Software Version
 - VarString: Modem Version
 - VarString: MCC
@@ -233,13 +283,27 @@ C body (Device → Server):
 T body:
 - [..+4] Timestamp (u32 be)
 - LocationData (per type)
-- SensorData (per type/version)
+- [..+1] SensorDataCount (u8) — number of SensorData items (currently 1)
+- SensorData item(s) (per type/version)
 
 A body:
 - empty
 
 C body (Server → Device):
 - empty
+
+M+ body:
+- [..+4] Timestamp (u32 be)
+- LocationData (per type)
+- [..+1] SensorDataCount (u8) — number of SensorData items (1)
+- SensorData: NullSensorData (type=0, ver=0, len=0)
+
+M- body:
+- [..+4] Timestamp (u32 be)
+- LocationData (per type)
+- [..+1] SensorDataCount (u8) — number of SensorData items (1)
+- SensorData: MotionSensorData (type=3, ver=1, len=payload)
+    - payload: battery (u8), rssi (u8), steps (i32)
 
 W body (Server → Device):
 - VarString: New Server Address
@@ -251,7 +315,7 @@ W body (Server → Device):
 - Endianness: All multi-byte integers and float32 are big-endian.
 - Floats: GNSS latitude/longitude are IEEE-754 float32 (binary32) big-endian.
 - Strings: ASCII only; not null-terminated; prefixed with length byte when VarString is used.
-- IMEI: Always 15 ASCII bytes in the header.
+- IMEI: Encoded as 8-byte packed BCD in the header.
 - Command 2-byte field: For single-char commands, second byte is 0x00. For “P+”, it is ASCII 'P' and '+'.
 - Timeouts and retries: The sample waits 30 seconds for Ack; implementers may choose retry strategies.
 - Record counts: Ensure record_count × record_size does not exceed your maximum packet size for your transport. UDP MTU considerations apply.

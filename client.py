@@ -19,13 +19,13 @@ Copyright: 2024 Tartabit, LLC
 """
 import os
 import time
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 
 import at
 import random
 from config import get_config
-from encoder_data import LocationData, SensorMultiData
-from encoder_packets import TelemetryPacket, ConfigPacket, PowerOnPacket
+from encoder_data import LocationData, SensorMultiData, NullSensorData, MotionSensorData
+from encoder_packets import TelemetryPacket, ConfigPacket, PowerOnPacket, MotionStartPacket, MotionStopPacket
 from decoder import PacketDecoder, DataReader
 import sensors
 
@@ -56,8 +56,12 @@ term.log = False
 
 # Initialize transaction ID and acknowledgment tracking
 transaction_id = 0
+# Per-transaction ACK handling to support out-of-order ACKs
+_ack_events = {}
+_acked_txn_ids = set()
+_ack_lock = Lock()
+# Backward-compatible event if someone waits for "any" ack (not typical)
 ack_event = Event()
-last_ack_txn_id = None
 def next_transaction_id():
     """
     Generate the next transaction ID, wrapping around at 65536.
@@ -71,34 +75,40 @@ def next_transaction_id():
 
 def wait_for_ack(txn_id=None, timeout=30):
     """
-    Wait for an acknowledgment to be received before proceeding.
+    Wait for an acknowledgment for the specified transaction ID.
 
-    This function waits until a URC with an 'A' command is received, or until the timeout expires.
-    If txn_id is provided, it also checks that the acknowledgment matches the expected transaction ID.
-
-    Args:
-        txn_id (int, optional): The transaction ID to wait for. If None, any acknowledgment will be accepted.
-        timeout (int, optional): Maximum time to wait in seconds. Defaults to 30.
-
-    Returns:
-        bool: True if an acknowledgment was received, False if a timeout occurred.
+    Supports out-of-order ACKs across multiple threads by using per-transaction
+    events. If txn_id is None, this waits for any ACK (legacy behavior).
     """
-    global ack_event, last_ack_txn_id
+    global _ack_events, _acked_txn_ids, _ack_lock, ack_event
 
-    # Clear the event before waiting
-    ack_event.clear()
-
-    # Wait for the event to be set with a timeout
-    if ack_event.wait(timeout):
-        # Event was set, check if the transaction ID matches (if provided)
-        if txn_id is not None and last_ack_txn_id != txn_id:
-            print(f"Warning: Received acknowledgment for transaction ID {last_ack_txn_id}, but expected {txn_id}")
-            return False
-        return True
-    else:
-        # Timeout occurred
-        print(f"Warning: Timeout waiting for acknowledgment after {timeout} seconds")
+    if txn_id is None:
+        # Legacy: wait for any ack
+        ack_event.clear()
+        if ack_event.wait(timeout):
+            return True
+        print(f"Warning: Timeout waiting for any acknowledgment after {timeout} seconds")
         return False
+
+    # Fast-path: if already acked
+    with _ack_lock:
+        if txn_id in _acked_txn_ids:
+            return True
+        ev = _ack_events.get(txn_id)
+        if ev is None:
+            ev = Event()
+            _ack_events[txn_id] = ev
+
+    # Wait for specific txn ack
+    if ev.wait(timeout):
+        # Clean-up mapping after successful wait
+        with _ack_lock:
+            _ack_events.pop(txn_id, None)
+            _acked_txn_ids.add(txn_id)
+        return True
+
+    print(f"Warning: Timeout waiting for acknowledgment for txn {txn_id} after {timeout} seconds")
+    return False
 
 
 # Initialize modem and get device information
@@ -209,9 +219,14 @@ def ack_handler_thread():
                             # Handle different command types
                             if command and command[0] == 'A':
                                 print(f"  Received '{command}' acknowledgement")
-                                # Set the acknowledgment event and store the transaction ID
-                                global last_ack_txn_id
-                                last_ack_txn_id = txn_id
+                                # Signal the specific transaction's event (out-of-order safe)
+                                global _ack_events, _acked_txn_ids, _ack_lock, ack_event
+                                with _ack_lock:
+                                    _acked_txn_ids.add(txn_id)
+                                    ev = _ack_events.pop(txn_id, None)
+                                if ev is not None:
+                                    ev.set()
+                                # Also set the legacy any-ack event for compatibility
                                 ack_event.set()
                             elif command and command[0] == 'C':
                                 # Configuration request command
@@ -263,52 +278,124 @@ config_packet = ConfigPacket(imei, server_address, reporting_interval, reading_i
 config_packet.send('Initial Configuration', term)
 wait_for_ack(txn_id)
 
+def telemetry_thread():
+    try:
+        while True:
+            txn_id = next_transaction_id()
+            timestamp = int(time.time())
+            battery = sensors.read_battery()
+            rssi = sensors.read_rssi(term)
+
+            # Build SensorMultiData records
+            try:
+                rc = max(1, int(reporting_interval // reading_interval))
+            except Exception:
+                rc = 1
+            first_reading = timestamp - (rc * int(reading_interval))
+            first_reading = first_reading - (first_reading % 60)
+            records = []
+            for _ in range(rc):
+                records.append({
+                    'temperature': sensors.read_temp(),
+                    'humidity': sensors.read_hum(),
+                })
+
+            sensor_data = SensorMultiData(battery, rssi, first_reading, int(reading_interval), records)
+            if get_config('location.type') == 'simulated':
+                lat, lon = sensors.read_loc()
+                loc = LocationData.gnss(lat, lon)
+            else:
+                cell = sensors.read_serving_cell(term)
+                loc = LocationData.cell(cell['mcc'], cell['mnc'], cell['lac'], cell['cell_id'], cell['rssi'])
+
+            telemetry_packet = TelemetryPacket(imei, timestamp, txn_id, loc, sensor_data)
+            telemetry_packet.send('Telemetry', term)
+            wait_for_ack(txn_id)
+
+            print(f"Waiting for {reporting_interval} seconds before next transmission...")
+            time.sleep(int(reporting_interval))
+    except Exception as e:
+        print(f"Telemetry thread encountered an error: {e}")
+
+
+def motion_thread(motion_duration: int, motion_interval: int):
+    try:
+        while True:
+            # Motion start
+            txn_id = next_transaction_id()
+            timestamp = int(time.time())
+            battery = sensors.read_battery()
+            rssi = sensors.read_rssi(term)
+            if get_config('location.type') == 'simulated':
+                lat, lon = sensors.read_loc()
+                loc = LocationData.gnss(lat, lon)
+            else:
+                cell = sensors.read_serving_cell(term)
+                loc = LocationData.cell(cell['mcc'], cell['mnc'], cell['lac'], cell['cell_id'], cell['rssi'])
+
+            # MotionStart uses NullSensorData (type 0, version 0)
+            mstart_sd = NullSensorData()
+            mstart = MotionStartPacket(imei, timestamp, txn_id, loc, mstart_sd)
+            mstart.send('Motion Start', term)
+            wait_for_ack(txn_id)
+
+            # Duration of motion
+            print(f"Motion active for {motion_duration} seconds...")
+            time.sleep(int(motion_duration))
+
+            # Motion stop
+            txn_id = next_transaction_id()
+            timestamp = int(time.time())
+            battery = sensors.read_battery()
+            rssi = sensors.read_rssi(term)
+            steps = sensors.read_steps(int(motion_duration))
+            if get_config('location.type') == 'simulated':
+                lat, lon = sensors.read_loc()
+                loc = LocationData.gnss(lat, lon)
+            else:
+                cell = sensors.read_serving_cell(term)
+                loc = LocationData.cell(cell['mcc'], cell['mnc'], cell['lac'], cell['cell_id'], cell['rssi'])
+
+            # MotionStop uses MotionSensorData (type 3) with battery, rssi, steps
+            mstop_sd = MotionSensorData(battery=battery, rssi=rssi, steps=steps)
+            mstop = MotionStopPacket(imei, timestamp, txn_id, loc, mstop_sd)
+            mstop.send('Motion Stop', term)
+            wait_for_ack(txn_id)
+
+            # Wait for the interval before next motion cycle
+            print(f"Waiting {motion_interval} seconds before next motion start...")
+            time.sleep(int(motion_interval))
+    except Exception as e:
+        print(f"Motion thread encountered an error: {e}")
+
+
+# Start worker threads
+telemetry = Thread(target=telemetry_thread, daemon=True)
+telemetry.start()
+
+# Start motion thread only if both config values are provided
+motion_duration = get_config('motionDuration')
+motion_interval = get_config('motionInterval')
+if motion_duration is not None and motion_interval is not None:
+    try:
+        md = int(motion_duration)
+        mi = int(motion_interval)
+        if md > 0 and mi > 0:
+            motion = Thread(target=motion_thread, args=(md, mi), daemon=True)
+            motion.start()
+        else:
+            print("motionDuration and motionInterval must be positive to enable motion events")
+    except Exception as e:
+        print(f"Invalid motion configuration: {e}")
+else:
+    print("Motion events disabled (motionDuration or motionInterval not set)")
+
+# Block main thread waiting for Ctrl-C
 try:
     while True:
-
-        # Increment transaction ID (wrap around at 65535)
-        txn_id = next_transaction_id()
-
-        # Get current data
-        timestamp = int(time.time())
-        battery = sensors.read_battery()
-        rssi = sensors.read_rssi(term)
-
-        
-        # Build records of temperature/humidity for SensorMultiData
-        # Number of records equals reporting_interval / reading_interval (integer)
-        try:
-            record_count = max(1, int(reporting_interval // reading_interval))
-        except Exception:
-            record_count = 1
-        # Compute first_reading timestamp: subtract record_count * reading_interval and round down to nearest minute
-        first_reading = timestamp - (record_count * reading_interval)
-        first_reading = first_reading - (first_reading % 60)
-        records = []
-        for _ in range(record_count):
-            records.append({
-                'temperature': sensors.read_temp(),
-                'humidity': sensors.read_hum(),
-            })
-
-        # Create telemetry packet
-        sensor_data = SensorMultiData(battery, rssi, first_reading, reading_interval, records)
-        if get_config('location.type')=="simulated":
-            lat, lon = sensors.read_loc()
-            loc = LocationData.gnss(lat, lon)
-        else:
-            cell = sensors.read_serving_cell(term)
-            loc = LocationData.cell(cell['mcc'],cell['mnc'],cell['lac'], cell['cell_id'], cell['rssi'])
-        telemetry_packet = TelemetryPacket(imei, timestamp, txn_id, loc, sensor_data)
-        telemetry_packet.send('Telemetry', term)
-        wait_for_ack(txn_id)
-
-        # Wait before next transmission using the configured reporting interval
-        print(f"Waiting for {reporting_interval} seconds before next transmission...")
-        time.sleep(reporting_interval)
+        time.sleep(1)
 except KeyboardInterrupt:
     print("\nCtrl+C detected. Exiting gracefully...")
-    # Perform any necessary cleanup here
     term.stopping = True
     term.ser.close()
     print("Goodbye!")

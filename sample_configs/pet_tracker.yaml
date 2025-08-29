@@ -1,23 +1,26 @@
-# Configuration for Murata 1SC EVK Low Powered Tracker Demo
+# Configuration for a package tracker demonstration.
 # All values can be overridden by command line parameters
 
 # Serial port for the modem (Windows example: COM3, Linux example: /dev/ttyUSB0)
 port: COM9
 
 # Server in the format host:port
-server: udp-eu.tartabit.com:10106
+#server: udp-eu.tartabit.com:10106
+#server: avro.x.tartabit.com:9100
+server: udp-eu.tartabit.com:9110
 
 location:
   # simulated, cellid
+  #type: cellid
   type: simulated
   lat: 45.448803450183924
   lon: -75.63533774831912
 
 # Reporting interval in seconds
-interval: 120
+interval: 43200
 
 # Reading interval in seconds (sensor sampling)
-readings: 60
+readings: 1
 
 # Motion event settings (if either is missing, motion events are disabled)
 motionDuration: 120   # seconds between motion start and motion stop
@@ -31,6 +34,6 @@ code: "00000000"
 
 # Packet data APN, uncomment the APN for your SIM card or set your own.
 # Telenor Connexion
-apn: connect.cxn
+#apn: connect.cxn
 # 1NCE
-#apn: iot.1nce.net
+apn: iot.1nce.net

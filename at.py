@@ -53,6 +53,8 @@ class AtTerminal:
         self.responseData = None
         self.responseSuccess = False
         self.urcQueue = queue.Queue()
+        # Serialize all command writes/reads across threads
+        self._cmd_lock = threading.Lock()
 
     def open(self):
         try:
@@ -122,22 +124,38 @@ class AtTerminal:
         else:
             command = None
 
-        if command:
-            self.responseEvent.clear()
-            self.responseData = None
-            self.responseSuccess = False
+        # Serialize all access to serial and response state
+        with self._cmd_lock:
+            if command:
+                self.responseEvent.clear()
+                self.responseData = None
+                self.responseSuccess = False
 
-            output = bytes(f'{str}\r\n', 'utf-8')
-            print(f'++ sending [{command}]: {output}') if debug else None
-            self.ser.write(output)
-            self.responseEvent.wait(timeout=5)
-            print(f"++ success: {self.responseSuccess}, data: {self.responseData}") if debug else None
-            atr = AtResponse(str, self.responseSuccess, self.responseData)
-        else:
-            output = bytes(f'{str}\r\n', 'utf-8')
-            print(f'++ sending: {output}') if debug else None
-            self.ser.write(output)
-            atr = AtResponse(str, True, None)
+                output = bytes(f'{str}\r\n', 'utf-8')
+                print(f'++ sending [{command}]: {output}') if debug else None
+                try:
+                    self.ser.write(output)
+                except SerialException as e:
+                    print(f'++ write exception: {e}')
+                    atr = AtResponse(str, False, None)
+                    if self.log:
+                        print(atr)
+                    return atr
+                self.responseEvent.wait(timeout=5)
+                print(f"++ success: {self.responseSuccess}, data: {self.responseData}") if debug else None
+                atr = AtResponse(str, self.responseSuccess, self.responseData)
+            else:
+                output = bytes(f'{str}\r\n', 'utf-8')
+                print(f'++ sending: {output}') if debug else None
+                try:
+                    self.ser.write(output)
+                except SerialException as e:
+                    print(f'++ write exception: {e}')
+                    atr = AtResponse(str, False, None)
+                    if self.log:
+                        print(atr)
+                    return atr
+                atr = AtResponse(str, True, None)
         if self.log:
             print(atr)
         return atr

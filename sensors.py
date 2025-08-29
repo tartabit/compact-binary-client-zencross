@@ -68,6 +68,17 @@ def read_rssi(term):
     rssi = int(rsp.split[0]) if rsp.success else 0xFF
     return rssi
 
+def read_steps(duration_seconds: int = 60) -> int:
+    """
+    Simulate a step count for the motion window.
+    Roughly 1-2 steps per second walking.
+    """
+    rate = random.uniform(0.8, 1.8)
+    steps = int(rate * max(1, duration_seconds))
+    # Add some noise
+    steps += random.randint(-5, 5)
+    return max(0, steps)
+
 def read_serving_cell(term):
     rsp = term.send_command('AT%MEAS="95"')
     if not rsp.success:
