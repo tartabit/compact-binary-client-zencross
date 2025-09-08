@@ -1,7 +1,9 @@
-# Zencross Low-Powered UDP Client
+# Compact Binary Client for Zencross
 
 This project provides a reference implementation of a UDP protocol that is efficient and simple to encode and decode for 
 use with Murata cellular modules and the Tartabit IoT Bridge.
+
+More information about the binary protocol can be found here: https://github.com/tartabit/compact-binary-protocol
 
 ## Overview
 
@@ -55,11 +57,15 @@ command-line options.
 
 ### Configuration via config.yaml
 
+Simulated Update Settings:
+- `updateDuration` (int, seconds): How long the client should wait to simulate performing an update after receiving a U+ request before sending the final U- status.
+- `updateFailureRate` (float 0.0..1.0): Probability that the simulated update will fail. If a failure occurs, the client sends U- with status "failed" and result "Simulated failure"; otherwise it sends status "success".
+
 You can configure the demo using a YAML file placed next to the script (`config.yaml`) or by providing a custom path with `--config`.
 
 - Precedence: command-line options override YAML values, which override built-in defaults.
 - Dotted keys: nested YAML values (e.g., `location.lat`) are supported; for convenience, `lat`/`lon` at the top-level also work as a fallback.
-- Available YAML fields: `port`, `server`, `location` (`type`, `lat`, `lon`), `interval`, `readings`, `motionDuration`, `motionInterval`, `imei`, `code`, `apn`.
+- Available YAML fields: `port`, `server`, `location` (`type`, `lat`, `lon`), `interval`, `readings`, `motionDuration`, `motionInterval`, `updateDuration`, `updateFailureRate`, `imei`, `code`, `apn`.
 
 Example `config.yaml`:
 ```
@@ -84,6 +90,10 @@ readings: 60
 # Motion event settings (if either is missing, motion events are disabled)
 motionDuration: 120   # seconds between motion start and motion stop
 motionInterval: 600   # seconds from motion end to next motion start
+
+# Simulated update settings (used when the server sends an Update Request U+)
+updateDuration: 5         # seconds to simulate update duration before final status
+updateFailureRate: 0.1    # 0.0..1.0 probability of failure; on failure, result="Simulated failure"
 
 # Optional: Override IMEI (otherwise read from modem)
 imei: 
@@ -140,6 +150,7 @@ Notes:
 - Defaults in this README match `client.py` (server udp-eu.tartabit.com:10106, report interval 120s, reading interval 60s).
 - Motion events (M+/M-) are enabled when both `motionDuration` and `motionInterval` are present and positive in the YAML; otherwise motion is disabled.
 - The demo acknowledges server A packets by matching Transaction IDs (ACKs may arrive out of order); configuration requests (C) are answered with a Configuration packet; write requests (W) are applied and confirmed.
+- When an Update Request (U+) arrives, the client spawns a thread that sends an Update Status (U-) with status "started", waits `updateDuration` seconds, then sends a final U- with status "success" or "failed" depending on `updateFailureRate`. On failure it includes result "Simulated failure".
 
 ## License
 

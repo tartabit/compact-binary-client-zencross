@@ -17,17 +17,38 @@ Packet types:
 Author: Tartabit, LLC
 Copyright: 2024 Tartabit, LLC
 """
-import os
 import time
 from threading import Thread, Event, Lock
 
 import at
-import random
 from config import get_config
-from encoder_data import LocationData, SensorMultiData, NullSensorData, MotionSensorData
-from encoder_packets import TelemetryPacket, ConfigPacket, PowerOnPacket, MotionStartPacket, MotionStopPacket
-from decoder import PacketDecoder, DataReader
 import sensors
+
+# Import decoders
+from compact_binary_protocol import (
+    PacketDecoder,
+    DataReader,
+)
+# Import packets
+from compact_binary_protocol import (
+    PowerOnPacket,
+    ConfigPacket,
+    TelemetryPacket,
+    MotionStartPacket,
+    MotionStopPacket,
+    UpdateRequestPacket,
+    UpdateStatusPacket,
+    PacketDecoder,
+    DataReader,
+)
+# Import sensor data types
+from compact_binary_protocol import (
+    LocationData,
+    SensorDataBasic,
+    SensorDataNull,
+    SensorDataMulti,
+    SensorDataSteps,
+)
 
 port = get_config('port')
 server_address = get_config('server')
@@ -73,6 +94,48 @@ def next_transaction_id():
     transaction_id = (transaction_id + 1) % 65536
     return transaction_id
 
+def send(reason, pkt):
+    packet_bytes = pkt.to_bytes()
+    term.send_command(f'AT%SOCKETDATA="SEND",1,{len(packet_bytes)},"{packet_bytes.hex()}"')
+    pkt.print(reason)
+
+
+def component_update(req, t_id):
+    try:
+        # 1) Send started status
+        started_pkt = UpdateStatusPacket(imei, t_id, req.component, 'started', '')
+        send('Update Started', started_pkt)
+        # 2) Wait for configured duration
+        try:
+            duration = int(get_config('updateDuration', 5))
+        except Exception:
+            duration = 5
+        time.sleep(max(0, duration))
+        # 3) Determine success/failure using configured failure rate
+        try:
+            failure_rate = float(get_config('updateFailureRate', 0.0))
+        except Exception:
+            failure_rate = 0.0
+        if failure_rate < 0:
+            failure_rate = 0.0
+        if failure_rate > 1:
+            failure_rate = 1.0
+        import random
+        failed = random.random() < failure_rate
+        # 4) Send final status
+        if failed:
+            final = UpdateStatusPacket(imei, t_id, req.component, 'failed', 'Simulated failure')
+            send('Update Failed', final)
+        else:
+            final = UpdateStatusPacket(imei, t_id, req.component, 'success', '')
+            send('Update Success', final)
+    except Exception as ex:
+        try:
+            err = UpdateStatusPacket(imei, t_id, req.component, 'failed', f'Exception: {ex}')
+            send('Update Failed (exception)', err)
+        except Exception:
+            pass
+
 def wait_for_ack(txn_id=None, timeout=30):
     """
     Wait for an acknowledgment for the specified transaction ID.
@@ -113,6 +176,8 @@ def wait_for_ack(txn_id=None, timeout=30):
 
 # Initialize modem and get device information
 term.send_command('ATE0')  # Turn off command echo
+term.send_command('ATE0')  # Turn off command echo
+
 term.send_command('AT+CMEE=2')  # Enable verbose error reporting
 if apn:
     print(f'Setting APN: {apn}')
@@ -233,28 +298,40 @@ def ack_handler_thread():
                                 print(f"  Received '{command}' command, sending configuration packet")
                                 # Use the received transaction ID for the response
                                 config_packet = ConfigPacket(imei, server_address, reporting_interval, txn_id)
-                                config_packet.send('Requested Configuration', term)
+                                send('Requested Configuration', config_packet)
                                 # No need to wait for acknowledgment here as we're already in the URC handler
                             elif command and command[0] == 'W':
                                 # Write configuration command
                                 print(f"  Received '{command}' command, updating configuration")
 
-                                reader = DataReader(data)
-                                new_server_address = reader.read_var_string()
-                                new_reporting_interval = reader.read_int4()
-                                new_reading_interval = reader.read_int4()
-
-                                server_address = new_server_address
-                                reporting_interval = new_reporting_interval
-                                reading_interval = new_reading_interval
-
+                                # Decode configuration payload into ConfigPacket
+                                try:
+                                    decoded_cfg = ConfigPacket.decode(imei, txn_id, data)
+                                    server_address = decoded_cfg.server_address
+                                    reporting_interval = decoded_cfg.reporting_interval
+                                    reading_interval = decoded_cfg.reading_interval
+                                except Exception as e:
+                                    print(f"  Failed to decode configuration payload: {e}")
+                                    # Keep existing config, but acknowledge with current config
                                 print(f"  Configuration updated: server={server_address}, reporting_interval={reporting_interval}, reading_interval={reading_interval}")
 
                                 config_packet = ConfigPacket(imei, server_address, reporting_interval, reading_interval, txn_id)
-                                config_packet.send('Configuration Updated', term)
+                                send('Configuration Updated', config_packet)
                                 # No need to wait for acknowledgment here as we're already in the URC handler
+                            elif command and command.startswith('U+'):
+                                # Update request command
+                                print(f"  Received '{command}' update request")
+                                try:
+                                    update_req = UpdateRequestPacket.decode(imei, txn_id, data)
+                                    print(f"  UpdateRequest: component={update_req.component}, url={update_req.url}, args={update_req.arguments}")
+                                    # Start simulated update in a separate thread
+
+                                    Thread(target=component_update, args=(update_req, txn_id), daemon=True).start()
+                                except Exception as e:
+                                    print(f"  Failed to decode/process UpdateRequest: {e}")
+                                # No ack wait here
                             else:
-                                print(f"Ignoring command '{command}', not supported (only 'C' and 'W' commands are supported)")
+                                print(f"Ignoring command '{command}', not supported (only 'C', 'W' and 'U+' commands are supported)")
                     print("*" * 50)
     except KeyboardInterrupt:
         print("\nCtrl+C detected. Exiting gracefully...")
@@ -269,13 +346,13 @@ ackHandler.start()
 # Send Power On packet
 txn_id = next_transaction_id()
 power_on_packet = PowerOnPacket(imei, txn_id, customer_id, software_version, modem_version, network[0:3], network[3:6], rat)
-power_on_packet.send('Power On', term)
+send('Power On', power_on_packet)
 wait_for_ack(txn_id)
 
 # Send initial configuration packet
 txn_id = next_transaction_id()
 config_packet = ConfigPacket(imei, server_address, reporting_interval, reading_interval, txn_id)
-config_packet.send('Initial Configuration', term)
+send('Initial Configuration', config_packet)
 wait_for_ack(txn_id)
 
 def telemetry_thread():
@@ -300,7 +377,7 @@ def telemetry_thread():
                     'humidity': sensors.read_hum(),
                 })
 
-            sensor_data = SensorMultiData(battery, rssi, first_reading, int(reading_interval), records)
+            sensor_data = SensorDataMulti(battery, rssi, first_reading, int(reading_interval), records)
             if get_config('location.type') == 'simulated':
                 lat, lon = sensors.read_loc()
                 loc = LocationData.gnss(lat, lon)
@@ -309,7 +386,7 @@ def telemetry_thread():
                 loc = LocationData.cell(cell['mcc'], cell['mnc'], cell['lac'], cell['cell_id'], cell['rssi'])
 
             telemetry_packet = TelemetryPacket(imei, timestamp, txn_id, loc, sensor_data)
-            telemetry_packet.send('Telemetry', term)
+            send('Telemetry', telemetry_packet)
             wait_for_ack(txn_id)
 
             print(f"Waiting for {reporting_interval} seconds before next transmission...")
@@ -334,9 +411,9 @@ def motion_thread(motion_duration: int, motion_interval: int):
                 loc = LocationData.cell(cell['mcc'], cell['mnc'], cell['lac'], cell['cell_id'], cell['rssi'])
 
             # MotionStart uses NullSensorData (type 0, version 0)
-            mstart_sd = NullSensorData()
+            mstart_sd = SensorDataNull()
             mstart = MotionStartPacket(imei, timestamp, txn_id, loc, mstart_sd)
-            mstart.send('Motion Start', term)
+            send('Motion Start', mstart)
             wait_for_ack(txn_id)
 
             # Duration of motion
@@ -357,9 +434,9 @@ def motion_thread(motion_duration: int, motion_interval: int):
                 loc = LocationData.cell(cell['mcc'], cell['mnc'], cell['lac'], cell['cell_id'], cell['rssi'])
 
             # MotionStop uses MotionSensorData (type 3) with battery, rssi, steps
-            mstop_sd = MotionSensorData(battery=battery, rssi=rssi, steps=steps)
+            mstop_sd = SensorDataSteps(battery=battery, rssi=rssi, steps=steps)
             mstop = MotionStopPacket(imei, timestamp, txn_id, loc, mstop_sd)
-            mstop.send('Motion Stop', term)
+            send('Motion Stop', mstop)
             wait_for_ack(txn_id)
 
             # Wait for the interval before next motion cycle

@@ -5,7 +5,8 @@
 port: COM9
 
 # Server in the format host:port
-server: udp-eu.tartabit.com:10106
+#server: udp-us.tartabit.com:9110
+server: udp-eu.tartabit.com:9110
 
 location:
   # simulated, cellid
@@ -23,6 +24,10 @@ readings: 1800
 # Motion event settings (if either is missing, motion events are disabled)
 #motionDuration: 120   # seconds between motion start and motion stop
 #motionInterval: 600   # seconds from motion end to next motion start
+
+# Simulated update settings
+updateDuration: 5         # seconds to simulate update duration
+updateFailureRate: 0.1    # 0.0..1.0 probability of failure
 
 # Optional: Override IMEI (otherwise read from modem)
 imei: 
