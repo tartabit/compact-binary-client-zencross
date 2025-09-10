@@ -236,6 +236,9 @@ print(f'Modem firmware version: {modem_version}')
 
 term.send_command('AT%SOCKETCMD="DELETE",1')
 
+print(f'Code: {customer_id}')
+print(f'Server Address: {server_address}')
+
 try:
     if server_address and ':' in server_address:
         server_host, server_port_str = server_address.split(':', 1)
@@ -307,7 +310,7 @@ def ack_handler_thread():
                                 # Decode configuration payload into ConfigPacket
                                 try:
                                     decoded_cfg = ConfigPacket.decode(imei, txn_id, data)
-                                    server_address = decoded_cfg.server_address
+                                    server_address = decoded_cfg.server_address if decoded_cfg.server_address else server_address
                                     reporting_interval = decoded_cfg.reporting_interval
                                     reading_interval = decoded_cfg.reading_interval
                                 except Exception as e:

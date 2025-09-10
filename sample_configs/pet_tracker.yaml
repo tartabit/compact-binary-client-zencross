@@ -8,6 +8,18 @@ port: COM13
 #server: udp-us.tartabit.com:9110
 server: udp-eu.tartabit.com:9110
 
+# Customer code (even-length hex string)
+code: "11223344"
+
+# Packet data APN, uncomment the APN for your SIM card or set your own.
+# Telenor Connexion
+#apn: connect.cxn
+# 1NCE
+apn: iot.1nce.net
+
+# Optional: Override IMEI (otherwise read from modem)
+imei:
+
 location:
   # simulated, cellid
   #type: cellid
@@ -29,14 +41,3 @@ motionInterval: 600   # seconds from motion end to next motion start
 updateDuration: 5         # seconds to simulate update duration
 updateFailureRate: 0.25   # 0.0..1.0 probability of failure
 
-# Optional: Override IMEI (otherwise read from modem)
-imei: 
-
-# Customer code (even-length hex string)
-code: "00000000"
-
-# Packet data APN, uncomment the APN for your SIM card or set your own.
-# Telenor Connexion
-#apn: connect.cxn
-# 1NCE
-apn: iot.1nce.net
