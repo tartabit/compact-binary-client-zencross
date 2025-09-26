@@ -9,8 +9,7 @@ the data in a compact binary format to reduce bandwidth usage. It also handles
 configuration commands from the server.
 
 Packet types:
-- 'P+': Power On - sent when the device first starts up
-- 'T': Telemetry - sent periodically with sensor data
+- 'T': Telemetry - sent periodically with sensor data and used on startup for identification
 - 'C': Configuration - sent in response to a configuration request
 - 'W': Write Configuration - received from server to update configuration
 
@@ -29,25 +28,21 @@ from compact_binary_protocol import (
     PacketDecoder,
     DataReader,
 )
-# Import packets
+# Import packets and data types
 from compact_binary_protocol import (
-    PowerOnPacket,
     ConfigPacket,
     TelemetryPacket,
-    MotionStartPacket,
-    MotionStopPacket,
-    UpdateRequestPacket,
-    UpdateStatusPacket,
     PacketDecoder,
     DataReader,
-)
-# Import sensor data types
-from compact_binary_protocol import (
-    LocationData,
-    SensorDataBasic,
-    SensorDataNull,
-    SensorDataMulti,
-    SensorDataSteps,
+    DataLocation,
+    DataBasic,
+    DataNull,
+    DataMulti,
+    DataSteps,
+    DataVersions,
+    DataNetworkInfo,
+    DataCustomerId,
+    DataKv,
 )
 
 port = get_config('port')
@@ -101,40 +96,8 @@ def send(reason, pkt):
 
 
 def component_update(req, t_id):
-    try:
-        # 1) Send started status
-        started_pkt = UpdateStatusPacket(imei, t_id, req.component, 'started', '')
-        send('Update Started', started_pkt)
-        # 2) Wait for configured duration
-        try:
-            duration = int(get_config('updateDuration', 5))
-        except Exception:
-            duration = 5
-        time.sleep(max(0, duration))
-        # 3) Determine success/failure using configured failure rate
-        try:
-            failure_rate = float(get_config('updateFailureRate', 0.0))
-        except Exception:
-            failure_rate = 0.0
-        if failure_rate < 0:
-            failure_rate = 0.0
-        if failure_rate > 1:
-            failure_rate = 1.0
-        import random
-        failed = random.random() < failure_rate
-        # 4) Send final status
-        if failed:
-            final = UpdateStatusPacket(imei, t_id, req.component, 'failed', 'Simulated failure')
-            send('Update Failed', final)
-        else:
-            final = UpdateStatusPacket(imei, t_id, req.component, 'success', '')
-            send('Update Success', final)
-    except Exception as ex:
-        try:
-            err = UpdateStatusPacket(imei, t_id, req.component, 'failed', f'Exception: {ex}')
-            send('Update Failed (exception)', err)
-        except Exception:
-            pass
+    # Updates removed from protocol; no-op
+    return
 
 def wait_for_ack(txn_id=None, timeout=30):
     """
@@ -280,9 +243,15 @@ def ack_handler_thread():
                         if packet_hex:
                             print(f"  Received packet: {packet_hex}")
 
-                            # Decode the packet header
-                            version, command, txn_id, data = PacketDecoder.decode_packet_header(packet_hex)
-                            print(f"  Decoded header: version={version}, command={command}, txn_id={txn_id}, data={data.hex()}")
+                            # Decode the packet header (now includes timestamp)
+                            decoded = PacketDecoder.decode_packet_header(packet_hex)
+                            if decoded and len(decoded) >= 5:
+                                version, command, txn_id, pkt_timestamp, data = decoded
+                            else:
+                                # Fallback for legacy (no timestamp parsed)
+                                version, command, txn_id, data = decoded
+                                pkt_timestamp = None
+                            print(f"  Decoded header: version={version}, command={command}, txn_id={txn_id}, timestamp={pkt_timestamp}, data={data.hex()}")
 
                             # Handle different command types
                             if command and command[0] == 'A':
@@ -296,45 +265,50 @@ def ack_handler_thread():
                                     ev.set()
                                 # Also set the legacy any-ack event for compatibility
                                 ack_event.set()
-                            elif command and command[0] == 'C':
-                                # Configuration request command
-                                print(f"  Received '{command}' command, sending configuration packet")
+                            elif command and (command == 'CR' or (command[0] == 'C' and command[1] in ('R', '\0'))):
+                                # Configuration request command (supports 'CR' and single-char 'C\0')
+                                print(f"  Received '{command}' command, sending configuration (Telemetry/Kv)")
                                 # Use the received transaction ID for the response
-                                config_packet = ConfigPacket(imei, server_address, reporting_interval, txn_id)
-                                send('Requested Configuration', config_packet)
+                                kv = DataKv({
+                                    'server': server_address,
+                                    'interval': str(reporting_interval),
+                                    'readings': str(reading_interval),
+                                })
+                                tcfg = TelemetryPacket(imei, int(time.time()), txn_id, 'C', kv)
+                                send('Requested Configuration (Telemetry/Kv)', tcfg)
                                 # No need to wait for acknowledgment here as we're already in the URC handler
-                            elif command and command[0] == 'W':
-                                # Write configuration command
+                            elif command and (command == 'CW' or (command[0] == 'W' and command[1] in ('\0', ' '))):
+                                # Write configuration command (supports 'CW' and single-char 'W\0')
                                 print(f"  Received '{command}' command, updating configuration")
 
                                 # Decode configuration payload into ConfigPacket
                                 try:
                                     decoded_cfg = ConfigPacket.decode(imei, txn_id, data)
-                                    server_address = decoded_cfg.server_address if decoded_cfg.server_address else server_address
-                                    reporting_interval = decoded_cfg.reporting_interval
-                                    reading_interval = decoded_cfg.reading_interval
+                                    cfg = decoded_cfg.to_dict()
+                                    server_address = cfg.get('server', server_address) or server_address
+                                    try:
+                                        reporting_interval = int(cfg.get('interval', reporting_interval))
+                                    except Exception:
+                                        pass
+                                    try:
+                                        reading_interval = int(cfg.get('readings', reading_interval))
+                                    except Exception:
+                                        pass
                                 except Exception as e:
                                     print(f"  Failed to decode configuration payload: {e}")
                                     # Keep existing config, but acknowledge with current config
                                 print(f"  Configuration updated: server={server_address}, reporting_interval={reporting_interval}, reading_interval={reading_interval}")
 
-                                config_packet = ConfigPacket(imei, server_address, reporting_interval, reading_interval, txn_id)
-                                send('Configuration Updated', config_packet)
+                                kv = DataKv({
+                                    'server': server_address,
+                                    'interval': str(reporting_interval),
+                                    'readings': str(reading_interval),
+                                })
+                                tcfg = TelemetryPacket(imei, int(time.time()), txn_id, 'C', kv)
+                                send('Configuration Updated (Telemetry/Kv)', tcfg)
                                 # No need to wait for acknowledgment here as we're already in the URC handler
-                            elif command and command.startswith('U+'):
-                                # Update request command
-                                print(f"  Received '{command}' update request")
-                                try:
-                                    update_req = UpdateRequestPacket.decode(imei, txn_id, data)
-                                    print(f"  UpdateRequest: component={update_req.component}, url={update_req.url}, args={update_req.arguments}")
-                                    # Start simulated update in a separate thread
-
-                                    Thread(target=component_update, args=(update_req, txn_id), daemon=True).start()
-                                except Exception as e:
-                                    print(f"  Failed to decode/process UpdateRequest: {e}")
-                                # No ack wait here
                             else:
-                                print(f"Ignoring command '{command}', not supported (only 'C', 'W' and 'U+' commands are supported)")
+                                print(f"Ignoring command '{command}', not supported (only 'C' and 'W' commands are supported)")
                     print("*" * 50)
     except KeyboardInterrupt:
         print("\nCtrl+C detected. Exiting gracefully...")
@@ -346,16 +320,26 @@ def ack_handler_thread():
 ackHandler = Thread(target=ack_handler_thread, daemon=True)
 ackHandler.start()
 
-# Send Power On packet
+# Send startup telemetry
 txn_id = next_transaction_id()
-power_on_packet = PowerOnPacket(imei, txn_id, customer_id, software_version, modem_version, network[0:3], network[3:6], rat)
-send('Power On', power_on_packet)
+sensors_list = [
+    DataCustomerId(customer_id),
+    DataVersions(software_version, modem_version),
+    DataNetworkInfo(network[0:3], network[3:6], rat),
+]
+startup_packet = TelemetryPacket(imei, int(time.time()), txn_id, 'P+', sensors_list)
+send('Startup Telemetry', startup_packet)
 wait_for_ack(txn_id)
 
-# Send initial configuration packet
+# Send initial configuration via Telemetry (DataKv)
 txn_id = next_transaction_id()
-config_packet = ConfigPacket(imei, server_address, reporting_interval, reading_interval, txn_id)
-send('Initial Configuration', config_packet)
+kv = DataKv({
+                                    'server': server_address,
+                                    'interval': str(reporting_interval),
+                                    'readings': str(reading_interval),
+                                })
+config_packet = TelemetryPacket(imei, int(time.time()), txn_id, 'C', kv)
+send('Initial Configuration (Telemetry/Kv)', config_packet)
 wait_for_ack(txn_id)
 
 def telemetry_thread():
@@ -380,15 +364,21 @@ def telemetry_thread():
                     'humidity': sensors.read_hum(),
                 })
 
-            sensor_data = SensorDataMulti(battery, rssi, first_reading, int(reading_interval), records)
+            sensor_data = DataMulti(battery, rssi, first_reading, int(reading_interval), records)
             if get_config('location.type') == 'simulated':
                 lat, lon = sensors.read_loc()
-                loc = LocationData.gnss(lat, lon)
+                loc = DataLocation.gnss(lat, lon)
             else:
                 cell = sensors.read_serving_cell(term)
-                loc = LocationData.cell(cell['mcc'], cell['mnc'], cell['lac'], cell['cell_id'], cell['rssi'])
+                loc = DataLocation.cell(cell['mcc'], cell['mnc'], cell['lac'], cell['cell_id'], cell['rssi'])
 
-            telemetry_packet = TelemetryPacket(imei, timestamp, txn_id, loc, sensor_data)
+            # Publish location as a client-side value (no longer embedded in packets)
+            try:
+                print(f"Published Location: {loc.describe()}")
+            except Exception:
+                print("Published Location: (unavailable)")
+
+            telemetry_packet = TelemetryPacket(imei, timestamp, txn_id, 'T', sensor_data)
             send('Telemetry', telemetry_packet)
             wait_for_ack(txn_id)
 
@@ -408,14 +398,17 @@ def motion_thread(motion_duration: int, motion_interval: int):
             rssi = sensors.read_rssi(term)
             if get_config('location.type') == 'simulated':
                 lat, lon = sensors.read_loc()
-                loc = LocationData.gnss(lat, lon)
+                loc = DataLocation.gnss(lat, lon)
             else:
                 cell = sensors.read_serving_cell(term)
-                loc = LocationData.cell(cell['mcc'], cell['mnc'], cell['lac'], cell['cell_id'], cell['rssi'])
+                loc = DataLocation.cell(cell['mcc'], cell['mnc'], cell['lac'], cell['cell_id'], cell['rssi'])
 
-            # MotionStart uses NullSensorData (type 0, version 0)
-            mstart_sd = SensorDataNull()
-            mstart = MotionStartPacket(imei, timestamp, txn_id, loc, mstart_sd)
+            # Publish location at motion start
+            try:
+                print(f"Published Location: {loc.describe()}")
+            except Exception:
+                print("Published Location: (unavailable)")
+            mstart = TelemetryPacket(imei, timestamp, txn_id, 'M+', loc)
             send('Motion Start', mstart)
             wait_for_ack(txn_id)
 
@@ -431,14 +424,18 @@ def motion_thread(motion_duration: int, motion_interval: int):
             steps = sensors.read_steps(int(motion_duration))
             if get_config('location.type') == 'simulated':
                 lat, lon = sensors.read_loc()
-                loc = LocationData.gnss(lat, lon)
+                loc = DataLocation.gnss(lat, lon)
             else:
                 cell = sensors.read_serving_cell(term)
-                loc = LocationData.cell(cell['mcc'], cell['mnc'], cell['lac'], cell['cell_id'], cell['rssi'])
+                loc = DataLocation.cell(cell['mcc'], cell['mnc'], cell['lac'], cell['cell_id'], cell['rssi'])
 
-            # MotionStop uses MotionSensorData (type 3) with battery, rssi, steps
-            mstop_sd = SensorDataSteps(battery=battery, rssi=rssi, steps=steps)
-            mstop = MotionStopPacket(imei, timestamp, txn_id, loc, mstop_sd)
+            # Publish location at motion stop
+            try:
+                print(f"Published Location: {loc.describe()}")
+            except Exception:
+                print("Published Location: (unavailable)")
+            mstop_data = [loc, DataSteps(battery=battery, rssi=rssi, steps=steps)]
+            mstop = TelemetryPacket(imei, timestamp, txn_id, 'M-', mstop_data)
             send('Motion Stop', mstop)
             wait_for_ack(txn_id)
 
