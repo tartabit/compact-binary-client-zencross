@@ -35,7 +35,7 @@ from compact_binary_protocol import (
     PacketDecoder,
     DataReader,
     DataLocation,
-    DataBasic,
+    DataDeviceStatus,
     DataNull,
     DataMulti,
     DataSteps,
@@ -364,14 +364,13 @@ def telemetry_thread():
                     'humidity': sensors.read_hum(),
                 })
 
-            sensor_data = DataMulti(battery, rssi, first_reading, int(reading_interval), records)
             if get_config('location.type') == 'simulated':
                 lat, lon = sensors.read_loc()
                 loc = DataLocation.gnss(lat, lon)
             else:
                 cell = sensors.read_serving_cell(term)
                 loc = DataLocation.cell(cell['mcc'], cell['mnc'], cell['lac'], cell['cell_id'], cell['rssi'])
-
+            sensor_data = [DataDeviceStatus(battery, rssi), loc, DataMulti(first_reading, int(reading_interval), records)]
             # Publish location as a client-side value (no longer embedded in packets)
             try:
                 print(f"Published Location: {loc.describe()}")
@@ -408,7 +407,7 @@ def motion_thread(motion_duration: int, motion_interval: int):
                 print(f"Published Location: {loc.describe()}")
             except Exception:
                 print("Published Location: (unavailable)")
-            mstart = TelemetryPacket(imei, timestamp, txn_id, 'M+', loc)
+            mstart = TelemetryPacket(imei, timestamp, txn_id, 'M+', [DataDeviceStatus(battery, rssi), loc])
             send('Motion Start', mstart)
             wait_for_ack(txn_id)
 
@@ -434,7 +433,7 @@ def motion_thread(motion_duration: int, motion_interval: int):
                 print(f"Published Location: {loc.describe()}")
             except Exception:
                 print("Published Location: (unavailable)")
-            mstop_data = [loc, DataSteps(battery=battery, rssi=rssi, steps=steps)]
+            mstop_data = [DataDeviceStatus(battery, rssi), loc, DataSteps(steps=steps)]
             mstop = TelemetryPacket(imei, timestamp, txn_id, 'M-', mstop_data)
             send('Motion Stop', mstop)
             wait_for_ack(txn_id)
